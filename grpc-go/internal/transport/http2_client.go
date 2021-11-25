@@ -143,6 +143,7 @@ type http2Client struct {
 	connectionID uint64
 }
 
+//
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr resolver.Address, useProxy bool, grpcUA string) (net.Conn, error) {
 	address := addr.Addr
 	networkType, ok := networktype.Get(addr)
@@ -207,6 +208,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	// address specific arbitrary data to reach custom dialers and credential handshakers.
 	connectCtx = icredentials.NewClientHandshakeInfoContext(connectCtx, credentials.ClientHandshakeInfo{Attributes: addr.Attributes})
 
+	//通过dial函数实现跟grpc服务器端的链接;底层调用是golang原生的net进行的tcp链接
 	conn, err := dial(connectCtx, opts.Dialer, addr, opts.UseProxy, opts.UserAgent)
 	if err != nil {
 		if opts.FailOnNonTempDialError {
@@ -361,9 +363,14 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	// Start the reader goroutine for incoming message. Each transport has
 	// a dedicated goroutine which reads HTTP2 frame from network. Then it
 	// dispatches the frame to the corresponding stream entity.
+
+	//启动一个协程，负责读取grpc服务器端发送的各种类型的帧;
+	//在帧握手阶段接受到服务器端发送的设置帧，窗口更新帧，将这些信息更新到客户端的本地
+	//也就是说，服务器端已经将自己能够发送、接受的帧的最大值，窗口大小给客户端，客户端需要更新到本地
 	go t.reader()
 
 	// Send connection preface to server.
+	// 链接建立后，向grpc服务器端发送“PRI * HTTP/2.0\r\n\r\n\SM\r\n\r\n”
 	n, err := t.conn.Write(clientPreface)
 	if err != nil {
 		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
@@ -377,6 +384,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	}
 	var ss []http2.Setting
 
+	//向grpc服务器端发送设置帧http2.Setting
 	if t.initialWindowSize != defaultWindowSize {
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingInitialWindowSize,
@@ -389,6 +397,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			Val: *opts.MaxHeaderListSize,
 		})
 	}
+	//向grpc服务器端发送窗口更新帧
 	err = t.framer.fr.WriteSettings(ss...)
 	if err != nil {
 		err = connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)

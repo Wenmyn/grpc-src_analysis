@@ -24,13 +24,20 @@ import "google.golang.org/grpc/resolver"
 
 const scheme = "passthrough"
 
+//默认自带的解析构建器
 type passthroughBuilder struct{}
 
 func (*passthroughBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+	/*
+		注：用户设置的链接地址，其实就是后端服务的真实地址
+		不需要再去远程访问获取后端服务地址列表了。
+	*/
 	r := &passthroughResolver{
-		target: target,
+		target: target,	//就是后端对应的服务器地址
 		cc:     cc,
 	}
+
+	//将获取到的后端服务地址列表信息更新到解析器里
 	r.start()
 	return r, nil
 }

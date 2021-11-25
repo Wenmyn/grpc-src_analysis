@@ -739,6 +739,7 @@ func (l *listenSocket) Close() error {
 func (s *Server) Serve(lis net.Listener) error {
 	s.mu.Lock()
 	s.printf("serving")
+	//表示grpc服务器处于运行状态
 	s.serve = true
 	if s.lis == nil {
 		// Serve called after Stop or GracefulStop.
@@ -755,7 +756,7 @@ func (s *Server) Serve(lis net.Listener) error {
 			<-s.done.Done()
 		}
 	}()
-
+	// 1.将监听进行存储，true表示处于监听状态
 	ls := &listenSocket{Listener: lis}
 	s.lis[ls] = true
 
@@ -776,6 +777,7 @@ func (s *Server) Serve(lis net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 
 	for {
+		//堵塞方式监听客户端的请求，如果没有请求时会一直堵塞此处
 		rawConn, err := lis.Accept()
 		if err != nil {
 			if ne, ok := err.(interface {
@@ -817,6 +819,8 @@ func (s *Server) Serve(lis net.Listener) error {
 		// Make sure we account for the goroutine so GracefulStop doesn't nil out
 		// s.conns before this conn can be added.
 		s.serveWG.Add(1)
+		// 针对新的链接，grpc服务器开启一个协程处理客户端的链接。
+		// 一个请求链接对应一个协程
 		go func() {
 			s.handleRawConn(lis.Addr().String(), rawConn)
 			s.serveWG.Done()
@@ -827,12 +831,15 @@ func (s *Server) Serve(lis net.Listener) error {
 // handleRawConn forks a goroutine to handle a just-accepted connection that
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
+	//检验grpc服务状态
 	if s.quit.HasFired() {
 		rawConn.Close()
 		return
 	}
+	//设置tcp链路的deadline
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
 
+	//http2握手，创建http2Server，跟客户端交换帧的初始化信息，如帧的大小，窗口大小等
 	// Finish handshaking (HTTP2)
 	st := s.newHTTP2Transport(rawConn)
 	rawConn.SetDeadline(time.Time{})
@@ -843,11 +850,15 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 	if !s.addConn(lisAddr, st) {
 		return
 	}
+	//创建一个协程，专门来处理流
 	go func() {
 		s.serveStreams(st)
 		s.removeConn(lisAddr, st)
 	}()
 }
+/*
+注：在服务器一侧，是用流来处理客户端发送过来的数据帧，头帧等类型数据
+*/
 
 func (s *Server) drainServerTransports(addr string) {
 	s.mu.Lock()
@@ -858,6 +869,7 @@ func (s *Server) drainServerTransports(addr string) {
 	s.mu.Unlock()
 }
 
+//服务器是如何跟客户端进行帧的握手的
 // newHTTP2Transport sets up a http/2 transport (using the
 // gRPC http2 server transport in transport/http2_server.go).
 func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {

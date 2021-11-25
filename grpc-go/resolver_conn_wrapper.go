@@ -46,6 +46,7 @@ type ccResolverWrapper struct {
 // newCCResolverWrapper uses the resolver.Builder to build a Resolver and
 // returns a ccResolverWrapper object which wraps the newly built resolver.
 func newCCResolverWrapper(cc *ClientConn, rb resolver.Builder) (*ccResolverWrapper, error) {
+	//这是解析器的包装类，跟解析器相关的一些操作都封装到这里
 	ccr := &ccResolverWrapper{
 		cc:   cc,
 		done: grpcsync.NewEvent(),
@@ -69,6 +70,9 @@ func newCCResolverWrapper(cc *ClientConn, rb resolver.Builder) (*ccResolverWrapp
 	// accessing ccr.resolver which is being assigned here.
 	ccr.resolverMu.Lock()
 	defer ccr.resolverMu.Unlock()
+
+	//通过Build来构建解析器resolver的；
+	//解析构建器是用来创建解析器的
 	ccr.resolver, err = rb.Build(cc.parsedTarget, ccr, rbo)
 	if err != nil {
 		return nil, err
@@ -102,6 +106,7 @@ func (ccr *ccResolverWrapper) UpdateState(s resolver.State) error {
 		ccr.addChannelzTraceEvent(s)
 	}
 	ccr.curState = s
+	//接下来是平衡器策略
 	if err := ccr.cc.updateResolverState(ccr.curState, nil); err == balancer.ErrBadResolverState {
 		return balancer.ErrBadResolverState
 	}

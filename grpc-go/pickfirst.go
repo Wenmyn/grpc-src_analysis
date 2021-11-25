@@ -63,12 +63,14 @@ func (b *pickfirstBalancer) ResolverError(err error) {
 }
 
 func (b *pickfirstBalancer) UpdateClientConnState(cs balancer.ClientConnState) error {
+	//至少满足一个地址
 	if len(cs.ResolverState.Addresses) == 0 {
 		b.ResolverError(errors.New("produced zero addresses"))
 		return balancer.ErrBadResolverState
 	}
 	if b.sc == nil {
 		var err error
+		//一个SubConn，管理着多个后端服务地址Addr;也就是说，管理着多个链接
 		b.sc, err = b.cc.NewSubConn(cs.ResolverState.Addresses, balancer.NewSubConnOptions{})
 		if err != nil {
 			if logger.V(2) {
@@ -80,8 +82,11 @@ func (b *pickfirstBalancer) UpdateClientConnState(cs balancer.ClientConnState) e
 			})
 			return balancer.ErrBadResolverState
 		}
+		//在真正tcp连接前，将平衡器的状态设置为Idle
 		b.state = connectivity.Idle
+		//更新ClientConn的状态为Idle，以及初始化picker
 		b.cc.UpdateState(balancer.State{ConnectivityState: connectivity.Idle, Picker: &picker{result: balancer.PickResult{SubConn: b.sc}}})
+		//开始链接
 		b.sc.Connect()
 	} else {
 		b.cc.UpdateAddresses(b.sc, cs.ResolverState.Addresses)

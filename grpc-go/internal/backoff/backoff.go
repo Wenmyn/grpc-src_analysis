@@ -51,7 +51,11 @@ type Exponential struct {
 
 // Backoff returns the amount of time to wait before the next retry given the
 // number of retries.
+// 参数retries，表示的是第几次重试，不是指要重试的次数
+
 func (bc Exponential) Backoff(retries int) time.Duration {
+	//bc类型就是Exponential
+	//就是前面的语句var
 	if retries == 0 {
 		return bc.Config.BaseDelay
 	}

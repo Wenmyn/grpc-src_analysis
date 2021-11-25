@@ -134,9 +134,12 @@ func (dcs *defaultConfigSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*ires
 // e.g. to use dns resolver, a "dns:///" prefix should be applied to the target.
 func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *ClientConn, err error) {
 	cc := &ClientConn{
-		target:            target,
-		csMgr:             &connectivityStateManager{},
+		target:            target,	//将地址target与ClientConn进行绑定
+		csMgr:             &connectivityStateManager{},	//链接过程中，链接的状态会发生变化
+		// 一个地址target可能对应多个后端服务地址（也就是说可能存在多个grpc服务器端提供相同的服务）
+		// 一个服务地址对应一个addrConn
 		conns:             make(map[*addrConn]struct{}),
+		// 设置默认的链接参数：如重试机制、健康校验函数、写缓存、读缓存、是否采用代理模式等
 		dopts:             defaultDialOptions(),
 		blockingpicker:    newPickerWrapper(),
 		czData:            new(channelzData),
@@ -146,10 +149,13 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	cc.safeConfigSelector.UpdateConfigSelector(&defaultConfigSelector{nil})
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
+	//将opts的值初始化到默认连接参数cc.dopts里
 	for _, opt := range opts {
 		opt.apply(&cc.dopts)
 	}
 
+	// 主要是设置拦截器
+	// 更新到客户端连接器ClientConn的unaryInt、chainUnaryInts、streamInt、chainStreamInts里
 	chainUnaryClientInterceptors(cc)
 	chainStreamClientInterceptors(cc)
 
@@ -177,6 +183,9 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		cc.csMgr.channelzID = cc.channelzID
 	}
 
+	//对链接安全进行校验操作
+	//如果想设置此次的tcp链接为非安全连接的话，需要显示的设置grpc.WithInsecure()；
+	//不设置的话，默认为安全连接
 	if cc.dopts.copts.TransportCredentials == nil && cc.dopts.copts.CredsBundle == nil {
 		return nil, errNoTransportSecurity
 	}
@@ -198,6 +207,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		}
 	}
 
+	//解析用户设置德服务配置ServiceConfig
 	if cc.dopts.defaultServiceConfigRawJSON != nil {
 		scpr := parseServiceConfig(*cc.dopts.defaultServiceConfigRawJSON)
 		if scpr.Err != nil {
@@ -250,6 +260,14 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		cc.dopts.bs = backoff.DefaultExponential
 	}
 
+	// 获取解析构建器
+	/*
+		grpc框架中可以同时存在多种解析器;
+		解析器构建器的注册，有两种方式：
+		1.一种是通过resolver.Register，进行注册
+		2.一种是通过设置grpc.WithResolvers（自定义多个解析构建器）来注册。
+		grpc.WithResolvers的优先级别高于resolver.Register
+	*/
 	// Determine the resolver to use.
 	resolverBuilder, err := cc.parseTargetAndFindResolver()
 	if err != nil {
@@ -291,6 +309,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		Target:           cc.parsedTarget,
 	}
 
+	//创建解析器的包装类ccResolverWrapper，将解析器封装到此类里
 	// Build the resolver.
 	rWrapper, err := newCCResolverWrapper(cc, resolverBuilder)
 	if err != nil {
@@ -300,6 +319,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	cc.resolverWrapper = rWrapper
 	cc.mu.Unlock()
 
+	// 设置堵塞式链接
 	// A blocking dial blocks until the clientConn is ready.
 	if cc.dopts.block {
 		for {
@@ -318,14 +338,20 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 				}
 			}
 			if !cc.WaitForStateChange(ctx, s) {
+				//说明：超时失败的原因，是因为链接失败导致的。并不是真正的因为用户设置的超时时间
 				// ctx got timeout or canceled.
 				if err = cc.connectionError(); err != nil && cc.dopts.returnLastError {
 					return nil, err
 				}
+				//如果返回这里的话，说明，链接还没有进行，用户设置的超时时间，就已经到期了
 				return nil, ctx.Err()
 			}
 		}
 	}
+	/* 思路：
+		1.跟grpc服务器端建立tcp链接是异步方式，这里可以不断的获取链接的状态
+		2.如果链接的状态为Ready，就是说明，链接完成了。否则异常。
+	*/
 
 	return cc, nil
 }
@@ -594,6 +620,7 @@ func init() {
 	emptyServiceConfig = cfg.Config.(*ServiceConfig)
 }
 
+//
 func (cc *ClientConn) maybeApplyDefaultServiceConfig(addrs []resolver.Address) {
 	if cc.sc != nil {
 		cc.applyServiceConfigAndBalancer(cc.sc, nil, addrs)
@@ -722,17 +749,19 @@ func (cc *ClientConn) switchBalancer(name string) {
 		cc.balancerWrapper.close()
 		cc.mu.Lock()
 	}
-
+	//根据传入的平衡器名称从注册里获取平衡构建器builder
 	builder := balancer.Get(name)
 	if builder == nil {
 		channelz.Warningf(logger, cc.channelzID, "Channel switches to new LB policy %q due to fallback from invalid balancer name", PickFirstBalancerName)
 		channelz.Infof(logger, cc.channelzID, "failed to get balancer builder for: %v, using pick_first instead", name)
+		//如果没有找到指定的平衡构建器，就使用默认的Pickerfirst构建器
 		builder = newPickfirstBuilder()
 	} else {
 		channelz.Infof(logger, cc.channelzID, "Channel switches to new LB policy %q", name)
 	}
-
+	//从平衡构建器里获取平衡器的名称赋值给cc.curBalancerName
 	cc.curBalancerName = builder.Name()
+	//创建平衡器包装对象
 	cc.balancerWrapper = newCCBalancerWrapper(cc, builder, cc.balancerBuildOpts)
 }
 
@@ -836,6 +865,7 @@ func (cc *ClientConn) incrCallsFailed() {
 // TODO(bar) Move this to the addrConn section.
 func (ac *addrConn) connect() error {
 	ac.mu.Lock()
+	//链接前的状态校验
 	if ac.state == connectivity.Shutdown {
 		ac.mu.Unlock()
 		return errConnClosing
@@ -844,11 +874,14 @@ func (ac *addrConn) connect() error {
 		ac.mu.Unlock()
 		return nil
 	}
+
+	//将addrConn结构体更新为Connecting;注意，平衡器的状态应该还是Idle
 	// Update connectivity state within the lock to prevent subsequent or
 	// concurrent calls from resetting the transport more than once.
 	ac.updateConnectivityState(connectivity.Connecting, nil)
 	ac.mu.Unlock()
 
+	//同步链接
 	ac.resetTransport()
 	return nil
 }
@@ -969,6 +1002,7 @@ func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method st
 	return t, done, nil
 }
 
+//这个涉及到serviceConfig和平衡器Balancer
 func (cc *ClientConn) applyServiceConfigAndBalancer(sc *ServiceConfig, configSelector iresolver.ConfigSelector, addrs []resolver.Address) {
 	if sc == nil {
 		// should never reach here.
@@ -1158,16 +1192,23 @@ func (ac *addrConn) adjustParams(r transport.GoAwayReason) {
 	}
 }
 
+// 针对grpc客户端跟grpc服务器端建立连接失败后，是否有重试机制
 func (ac *addrConn) resetTransport() {
 	ac.mu.Lock()
+	//链接前，先进行状态的校验，若状态为shutdown，就不再链接，直接退出
 	if ac.state == connectivity.Shutdown {
 		ac.mu.Unlock()
 		return
 	}
 
 	addrs := ac.addrs
+	//链接失败后，需要进行重试，计算出需要等待多长时间才能重试。
+	//backoffFor就是需要等待的时间;
+	//ac.backoffIdx表示第几次重试
 	backoffFor := ac.dopts.bs.Backoff(ac.backoffIdx)
 	// This will be the duration that dial gets to finish.
+	//计算出本次向grpc服务器端尝试建立TCP链接的最长时间，超时这个时间没有链接成功，
+	//就主动断开，等待尝试下一次的链接
 	dialDuration := minConnectTimeout
 	if ac.dopts.minConnectTimeout != nil {
 		dialDuration = ac.dopts.minConnectTimeout()
@@ -1185,24 +1226,38 @@ func (ac *addrConn) resetTransport() {
 	// https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md#proposed-backoff-algorithm
 	connectDeadline := time.Now().Add(dialDuration)
 
+	//更新结构体addConn的状态为Connecting，以及将平衡器、ClientConn的状态设置为Connecting
 	ac.updateConnectivityState(connectivity.Connecting, nil)
 	ac.mu.Unlock()
 
+	//重点：具体链接操作
 	if err := ac.tryAllAddrs(addrs, connectDeadline); err != nil {
+		//向服务器端建立链接失败后的处理逻辑
 		ac.cc.resolveNow(resolver.ResolveNowOptions{})
 		// After exhausting all addresses, the addrConn enters
 		// TRANSIENT_FAILURE.
 		ac.mu.Lock()
+		//对状态进行校验，若当前链接的状态是Shutdown，直接退出，不会再次进行尝试链接
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return
 		}
+		//更新平衡器、addrConn、ClientConn状态为TransientFailure
 		ac.updateConnectivityState(connectivity.TransientFailure, err)
 
 		// Backoff.
 		b := ac.resetBackoff
 		ac.mu.Unlock()
 
+		//time跟select组成多路复用定时器：
+
+		//1.定时的超时时间就是前面计算的backoffFor;
+		//2.通道一：重试次数累加1，继续重新进行链接（再进行下次链接时候，需要等待一段时间）
+		//3.通道二：不再等待超时时间，定时器立马结束，继续重新进行链接
+		//4.通道三：上下文结束，定时器立马结束，注意此时不再进行重试链接了
+
+		//——测试：可以不启动grpc服务器端，只启动grpc客户端，就会发现前面链接失败后，
+		//就会马上进行重新链接，越到后面，链接失败后，等待重新链接的时间会越长
 		timer := time.NewTimer(backoffFor)
 		select {
 		case <-timer.C:
@@ -1215,6 +1270,7 @@ func (ac *addrConn) resetTransport() {
 			timer.Stop()
 			return
 		}
+
 
 		ac.mu.Lock()
 		if ac.state != connectivity.Shutdown {
@@ -1234,8 +1290,10 @@ func (ac *addrConn) resetTransport() {
 // connected, or updates ac appropriately with the new transport.
 func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.Time) error {
 	var firstConnErr error
+	//对所有的后端服务地址进行连接;但是只要有一个链接成功，就退出
 	for _, addr := range addrs {
 		ac.mu.Lock()
+		//连接前，先进行状态校验
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return errConnClosing
@@ -1252,8 +1310,12 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 		ac.mu.Unlock()
 
 		channelz.Infof(logger, ac.channelzID, "Subchannel picks a new address %q to connect", addr.Addr)
-
+		//进行连接
 		err := ac.createTransport(addr, copts, connectDeadline)
+		//这里的addrs虽然是切片，但是，只会传递一个地址
+		//不同平衡器的链接策略是在UpdateClientConnState方法里的设置的
+		//如果想链接所有的服务器地址的话，可以在此方法里的设置的
+		//比方说baseBalancer平衡器，就是在UpdateClientConnState里链接所有的服务地址列表的
 		if err == nil {
 			return nil
 		}
@@ -1270,6 +1332,7 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 // createTransport creates a connection to addr. It returns an error if the
 // address was not successfully connected, or updates ac appropriately with the
 // new transport.
+// 进入tcp链接阶段
 func (ac *addrConn) createTransport(addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time) error {
 	// TODO: Delete prefaceReceived and move the logic to wait for it into the
 	// transport.
@@ -1316,6 +1379,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 		copts.ChannelzParentID = ac.channelzID
 	}
 
+	//核心
 	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, addr, copts, func() { prefaceReceived.Fire() }, onGoAway, onClose)
 	if err != nil {
 		// newTr is either nil, or closed.

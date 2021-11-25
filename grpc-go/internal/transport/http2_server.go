@@ -159,8 +159,13 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if config.MaxHeaderListSize != nil {
 		maxHeaderListSize = *config.MaxHeaderListSize
 	}
+	// 在服务器创建了Framer，Framer内部其实是调用的是http2包中的newFramer方法，通过此方法创建http2的帧
 	framer := newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize)
 	// Send initial settings as connection preface to client.
+
+	// 初始化设置帧，类型是http2.Setting切片；
+	// 包括：帧的最大值，最大流数，初始化窗口大小等的设置，然后将这些信息发送给客户端，
+	// 客户端会根据这些信息，更新本地的相应设置。
 	isettings := []http2.Setting{{
 		ID:  http2.SettingMaxFrameSize,
 		Val: http2MaxFrameLen,
@@ -207,6 +212,8 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	if err := framer.fr.WriteSettings(isettings...); err != nil {
 		return nil, connectionErrorf(false, err, "transport: %v", err)
 	}
+
+	//向客户端发送窗口更新帧
 	// Adjust the connection flow control window if needed.
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
 		if err := framer.fr.WriteWindowUpdate(0, delta); err != nil {
@@ -289,6 +296,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		}
 	}()
 
+	//从tcp链接里读取客户端发送过来的PRI值，跟服务器端存储的clientPreface值进行比较，校验
 	// Check the validity of client preface.
 	preface := make([]byte, len(clientPreface))
 	if _, err := io.ReadFull(t.conn, preface); err != nil {
@@ -306,6 +314,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 	}
 
+	//读取客户端发送过来的帧，并转换成设置帧，然后将设置帧的内容更新到本地
 	frame, err := t.framer.fr.ReadFrame()
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		return nil, err
@@ -320,6 +329,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	}
 	t.handleSettings(sf)
 
+	//创建一个协程，来启动帧发送器
 	go func() {
 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst)
 		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
@@ -332,9 +342,13 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		t.controlBuf.finish()
 		close(t.writerDone)
 	}()
+	//创建一个协程，来启动keepalive；说明服务器端的keepalive，默认是启动的
 	go t.keepalive()
 	return t, nil
 }
+/*
+注：通过这些操作，双方已经知道了对方接受数据的能力，接下来就进入了流的处理阶段
+*/
 
 // operateHeader takes action on the decoded headers.
 func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {

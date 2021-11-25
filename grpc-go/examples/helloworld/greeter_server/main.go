@@ -47,13 +47,17 @@ func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloRe
 
 func main() {
 	flag.Parse()
+	//创建一个监听目标，只监听tcp协议的请求，端口号是port
 	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
+	//创建grpc服务器
 	s := grpc.NewServer()
+	//将服务注册到grpc服务器里
 	pb.RegisterGreeterServer(s, &server{})
 	log.Printf("server listening at %v", lis.Addr())
+	//启动grpc服务器对监听目标开始监听
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
